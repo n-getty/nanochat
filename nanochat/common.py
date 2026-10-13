@@ -27,8 +27,11 @@ def _detect_compute_dtype():
         # fp16 training requires GradScaler (not yet implemented), so fall back to fp32.
         # Users can still force fp16 via NANOCHAT_DTYPE=float16 if they know what they're doing.
         return torch.float32, f"auto-detected: CUDA SM {capability[0]}{capability[1]} (pre-Ampere, bf16 not supported, using fp32)"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        # Intel Max Series (Aurora) supports bf16 natively.
+        return torch.bfloat16, "auto-detected: XPU (bf16 supported)"
     # Note: MPS on recent macOS also handles bf16 fine, opt in via NANOCHAT_DTYPE=bfloat16
-    return torch.float32, "auto-detected: no CUDA (CPU/MPS)"
+    return torch.float32, "auto-detected: no CUDA/XPU (CPU/MPS)"
 COMPUTE_DTYPE, COMPUTE_DTYPE_REASON = _detect_compute_dtype()
 
 class ColoredFormatter(logging.Formatter):
@@ -161,9 +164,11 @@ def get_dist_info():
         return False, 0, 0, 1
 
 def autodetect_device_type():
-    # prefer to use CUDA if available, otherwise use MPS, otherwise fallback on CPU
+    # prefer to use CUDA if available, otherwise XPU, otherwise MPS, otherwise fallback on CPU
     if torch.cuda.is_available():
         device_type = "cuda"
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        device_type = "xpu"
     elif torch.backends.mps.is_available():
         device_type = "mps"
     else:
@@ -171,12 +176,14 @@ def autodetect_device_type():
     print0(f"Autodetected device type: {device_type}")
     return device_type
 
-def compute_init(device_type="cuda"): # cuda|cpu|mps
+def compute_init(device_type="cuda"): # cuda|xpu|cpu|mps
     """Basic initialization that we keep doing over and over, so make common."""
 
-    assert device_type in ["cuda", "mps", "cpu"], "Invalid device type atm"
+    assert device_type in ["cuda", "xpu", "mps", "cpu"], "Invalid device type atm"
     if device_type == "cuda":
         assert torch.cuda.is_available(), "Your PyTorch installation is not configured for CUDA but device_type is 'cuda'"
+    if device_type == "xpu":
+        assert hasattr(torch, "xpu") and torch.xpu.is_available(), "Your PyTorch installation is not configured for XPU but device_type is 'xpu'"
     if device_type == "mps":
         assert torch.backends.mps.is_available(), "Your PyTorch installation is not configured for MPS but device_type is 'mps'"
 
@@ -186,20 +193,30 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
     torch.manual_seed(42)
     if device_type == "cuda":
         torch.cuda.manual_seed(42)
+    elif device_type == "xpu":
+        torch.xpu.manual_seed(42)
     # skipping full reproducibility for now, possibly investigate slowdown later
     # torch.use_deterministic_algorithms(True)
 
     # Precision
-    if device_type == "cuda":
+    if device_type in ["cuda", "xpu"]:
         torch.set_float32_matmul_precision("high") # uses tf32 instead of fp32 for matmuls, see https://docs.pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
 
-    # Distributed setup: Distributed Data Parallel (DDP), optional, and requires CUDA
+    # Distributed setup: Distributed Data Parallel (DDP), optional, and requires CUDA/XPU
     is_ddp_requested, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     if is_ddp_requested and device_type == "cuda":
         device = torch.device("cuda", ddp_local_rank)
         torch.cuda.set_device(device)  # make "cuda" default to this device
         dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
+    elif is_ddp_requested and device_type == "xpu":
+        # Aurora (Intel Max Series) distributed path: xccl is the native XPU backend.
+        # NOTE: deliberately no dist.barrier() immediately after init here -- an
+        # early barrier was observed to SIGSEGV on Aurora; init_process_group alone
+        # is sufficient before the first real collective.
+        device = torch.device("xpu", ddp_local_rank)
+        torch.xpu.set_device(device)  # make "xpu" default to this device
+        dist.init_process_group(backend="xccl", init_method="env://", rank=ddp_rank, world_size=ddp_world_size)
     else:
         device = torch.device(device_type) # mps|cpu
 

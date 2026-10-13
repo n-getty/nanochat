@@ -42,7 +42,7 @@ parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
-parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--device-type", type=str, default="", help="cuda|xpu|cpu|mps (empty = autodetect)")
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
@@ -85,10 +85,11 @@ user_config = vars(args).copy()  # for logging
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
-get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
-if device_type == "cuda":
-    gpu_device_name = torch.cuda.get_device_name(0)
+_accel_backend = torch.xpu if device_type == "xpu" else torch.cuda
+synchronize = _accel_backend.synchronize if device_type in ("cuda", "xpu") else lambda: None
+get_max_memory = _accel_backend.max_memory_allocated if device_type in ("cuda", "xpu") else lambda: 0
+if device_type in ("cuda", "xpu"):
+    gpu_device_name = _accel_backend.get_device_name(0)
     gpu_peak_flops = get_peak_flops(gpu_device_name)
     print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
 else:
@@ -166,7 +167,7 @@ if resuming:
 
 # Convert Linear layers to Float8Linear if --fp8 is set
 if args.fp8:
-    if device_type != "cuda":
+    if device_type not in ("cuda",):
         print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
     else:
         # our custom fp8 is simpler than torchao, written for exact API compatibility
@@ -243,7 +244,12 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+if device_type == "xpu":
+    # torch.compile's Triton-based inductor backend is not yet reliable on XPU;
+    # train eagerly until Aurora's compile stack catches up.
+    print0("XPU device: skipping torch.compile, training eagerly")
+else:
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.

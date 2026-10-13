@@ -58,6 +58,12 @@ cpu = [
 gpu = [
     "torch==2.9.1",
 ]
+# Aurora (ALCF, Intel Max Series XPU): does NOT pull torch from PyPI -- `module
+# load frameworks` provides a patched torch build with native XPU dispatch keys
+# and xccl distributed support already compiled in. This extra only exists so
+# `uv sync --extra xpu` resolves the non-torch deps without conflicting with
+# the cpu/gpu extras' pinned torch wheel.
+xpu = []
 
 [tool.uv]
 default-groups = []
@@ -65,5 +71,6 @@ conflicts = [
     [
         { extra = "cpu" },
         { extra = "gpu" },
+        { extra = "xpu" },
     ],
 ]

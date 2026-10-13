@@ -73,10 +73,11 @@ device_type = autodetect_device_type() if args.device_type == "" else args.devic
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
-synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
-get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
-if device_type == "cuda":
-    gpu_device_name = torch.cuda.get_device_name(0)
+_accel_backend = torch.xpu if device_type == "xpu" else torch.cuda
+synchronize = _accel_backend.synchronize if device_type in ("cuda", "xpu") else lambda: None
+get_max_memory = _accel_backend.max_memory_allocated if device_type in ("cuda", "xpu") else lambda: 0
+if device_type in ("cuda", "xpu"):
+    gpu_device_name = _accel_backend.get_device_name(0)
     gpu_peak_flops = get_peak_flops(gpu_device_name)
     print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
 else:
@@ -277,7 +278,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                 last_step = True
 
         # Build tensors
-        use_cuda = device_type == "cuda"
+        use_cuda = device_type in ("cuda", "xpu")
         batch_tensor = torch.tensor(rows, dtype=torch.long, pin_memory=use_cuda)
         inputs = batch_tensor[:, :-1].to(device=device, dtype=torch.int32, non_blocking=use_cuda).contiguous()
         targets = batch_tensor[:, 1:].to(device=device, dtype=torch.int64, non_blocking=use_cuda).contiguous()
