@@ -14,13 +14,24 @@ import torch.distributed as dist
 from torch import Tensor
 from nanochat.common import COMPUTE_DTYPE
 
+# torch.compile's Triton-based inductor backend is not yet reliable on XPU
+# (same reasoning base_train.py uses to skip compiling the model there), and
+# on top of that, a cold-cache compile of these fused kernels only breaks
+# even after ~600 steps (benchmarked on Aurora: ~28s compile tax against a
+# ~45ms/step steady-state saving) -- well beyond the ~150-step runs typical
+# of short sweeps/demos, where every participant starts from an empty cache.
+# Train eagerly on XPU until the compile stack and cold-start cost improve.
+_SKIP_COMPILE = hasattr(torch, "xpu") and torch.xpu.is_available()
+def _maybe_compile(fn):
+    return fn if _SKIP_COMPILE else torch.compile(fn, dynamic=False, fullgraph=True)
+
 # -----------------------------------------------------------------------------
 """
 Good old AdamW optimizer, fused kernel.
 https://arxiv.org/abs/1711.05101
 """
 
-@torch.compile(dynamic=False, fullgraph=True)
+@_maybe_compile
 def adamw_step_fused(
     p: Tensor,              # (32768, 768) - parameter tensor
     grad: Tensor,           # (32768, 768) - gradient, same shape as p
@@ -108,7 +119,7 @@ polar_express_coeffs = [
 ]
 
 
-@torch.compile(dynamic=False, fullgraph=True)
+@_maybe_compile
 def muon_step_fused(
     stacked_grads: Tensor,          # (12, 768, 3072) - stacked gradients
     stacked_params: Tensor,         # (12, 768, 3072) - stacked parameters
